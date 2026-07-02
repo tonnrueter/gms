@@ -24,16 +24,15 @@ checkAppearance <- function(x, capitalExclusionList = NULL) {
   w <- NULL
   ptm <- proc.time()["elapsed"]
   message("  Running checkAppearance...")
-  colnames <- unique(names(x$code))
-  rownames <- unique(x$declarations[, "names"])
-
-  if (!is.null(x$not_used)) rownames <- unique(c(rownames, x$not_used[, "name"]))
+  moduleNames <- unique(names(x$code))
+  objectNames <- unique(x$declarations[, "names"])
+  if (!is.null(x$not_used)) objectNames <- unique(c(objectNames, x$not_used[, "name"]))
 
   # check for variables with different capitalization in declarations
-  if (length(rownames[duplicated(tolower(rownames))]) > 0) {
+  if (length(objectNames[duplicated(tolower(objectNames))]) > 0) {
     w <- .warning(paste0(
       "Found variables with more than one capitalization in declarations and not_used.txt files: ",
-      paste0(rownames[duplicated(tolower(rownames))], collapse = ", ")
+      paste0(objectNames[duplicated(tolower(objectNames))], collapse = ", ")
     ), w = w)
   }
 
@@ -43,61 +42,62 @@ checkAppearance <- function(x, capitalExclusionList = NULL) {
   tmp <- grep("execute_load", x$code, ignore.case = TRUE)
   x$code[tmp] <- gsub("=[^,]*", "", x$code[tmp])
 
-  tmp <- sapply(colnames, function(name, x) {
-    return(paste(x[names(x) == name], collapse = " "))
-  }, x$code)
-
   # add empty entry in tmp for module realization which do not contain any code but have a not_used.txt
-  notUsedNames <- unique(dimnames(x$not_used)[[1]])
-  missing <- notUsedNames[!(notUsedNames %in% colnames)]
+  modulesWithNotUsedFile <- unique(dimnames(x$not_used)[[1]])
+  missing <- modulesWithNotUsedFile[!(modulesWithNotUsedFile %in% moduleNames)]
   if (length(missing) > 0) {
-    mtmp <- rep("", length(missing))
-    names(mtmp) <- missing
-    tmp <- c(tmp, mtmp)
-    colnames <- c(colnames, missing)
+    moduleNames <- c(moduleNames, missing)
   }
 
-  declarationsRegex <- paste("(^|[^[:alnum:]_])", escapeRegex(rownames), "($|[^[:alnum:]_])", sep = "")
+  # Strip string literals so that variable names inside strings are not matched.
+  # Both double-quoted and single-quoted GAMS strings are removed. The patterns use a
+  # negated character class (not a greedy ".*").
+  code <- x$code
+  code <- gsub("\"[^\"]*\"", "", code)
+  code <- gsub("'[^']*'", "", code)
 
   message("  Start variable matching...            (time elapsed: ",
           format(proc.time()["elapsed"] - ptm, width = 6, nsmall = 2, digits = 2), ")")
 
-  # This part is the most time consuming (90% of the time in codeCheck). Here, the variable names are searched for in
-  # all module realizations. This process primarily seems to scale with the number of variables and not with the number
-  # of module realizations. It is hard to optimize since the number of variables that the code has to look for can
-  # hardly be reduced
-  a <- t(sapply(declarationsRegex, grepl, tmp, perl = TRUE))
+  # Tokenize all code lines at once and build an inverted (token -> module) index.
+  # This is O(code size) rather than O(symbols x code size), replacing the grepl sweep.
+  allTokenLists <- strsplit(code, "[^[:alnum:]_]+", perl = TRUE)
+  lineLengths   <- lengths(allTokenLists)
+  tokenVec      <- unlist(allTokenLists, use.names = FALSE)
+  lowerTokenVec <- tolower(tokenVec)
+  moduleVec     <- rep(names(code), lineLengths)
+
+  # keep only non-empty tokens that are declared symbols
+  isSymbol      <- nzchar(tokenVec) & (tokenVec %in% objectNames)
+  symbolTokens  <- tokenVec[isSymbol]
+  symbolModules <- moduleVec[isSymbol]
+
+  objectsToModules <- matrix(FALSE, nrow = length(objectNames), ncol = length(moduleNames),
+                             dimnames = list(objectNames, moduleNames))
+  if (length(symbolTokens) > 0) {
+    objectsToModules[cbind(match(symbolTokens, objectNames),
+                           match(symbolModules, moduleNames))] <- TRUE
+  }
 
   message("  Finished variable matching...         (time elapsed: ",
           format(proc.time()["elapsed"] - ptm, width = 6, nsmall = 2, digits = 2), ")")
 
-  dimnames(a)[[1]] <- rownames
-  dimnames(a)[[2]] <- colnames
-
-  # Find variables with different capitalization
-
-  code <- x$code
-  # exclude \" comments \"
-  code <- gsub("\\\".*\\\"", "", code)
-  # exclude any text surrounded by with single quotes
-  code <- gsub("'.*'", "", code)
-  # exclude display statements
-  code <- gsub("display.*", "", code)
-
   message("  Start var capitalization check...     (time elapsed: ",
           format(proc.time()["elapsed"] - ptm, width = 6, nsmall = 2, digits = 2), ")")
 
-  # check for each variable if it appears with different capitalization in the code
-  duplicates <- sapply(declarationsRegex, function(x) {
-    # get all lines of code that match the variable (case insensitive)
-    chunks <- code[grepl(x, code, ignore.case = TRUE)]
-    # if case sensitive search yields less results, there must be occurrences different capitalization
-    return(length(chunks) != length(chunks[grepl(x, chunks, ignore.case = FALSE)]))
-  })
+  tokenVecForCap        <- unlist(strsplit(code, "[^[:alnum:]_]+", perl = TRUE),
+                                  use.names = FALSE)
+  lowerTokenVecForCap   <- tolower(tokenVecForCap)
 
-  if (length(rownames[setdiff(rownames[duplicates], capitalExclusionList)] > 0)) {
+  # Find symbols that appear with more than one capitalisation variant in the code.
+  # tapply groups actual tokens by their lowercase form; count > 1 means mixed casing.
+  casingCounts <- tapply(tokenVecForCap, lowerTokenVecForCap, function(v) length(unique(v)))
+  multiCaseSet <- names(casingCounts)[casingCounts > 1L]
+  duplicates   <- tolower(objectNames) %in% multiCaseSet
+  names(duplicates) <- objectNames
 
-    duplicateNames <- unname(setdiff(rownames[duplicates], capitalExclusionList))
+  if (length(objectNames[setdiff(objectNames[duplicates], capitalExclusionList)] > 0)) {
+    duplicateNames <- unname(setdiff(objectNames[duplicates], capitalExclusionList))
 
     msg <- paste0(
       "Found variables with more than one capitalization in the codebase: ",
@@ -105,13 +105,18 @@ checkAppearance <- function(x, capitalExclusionList = NULL) {
     )
 
     for (dup in duplicateNames) {
-      msg <- paste0(msg, "- Lines found for item '", dup, "':\n")
-      dup <- paste("(^|[^[:alnum:]_])", escapeRegex(dup), "($|[^[:alnum:]_])", sep = "")
-      chunks <- code[grepl(dup, code, ignore.case = TRUE)]
-      msg <- paste0(msg, paste0(setdiff(chunks, chunks[grepl(dup, chunks, ignore.case = FALSE)]), collapse = "\n"))
+      msg <- paste0(msg, "- Suspicious lines found for item '", dup, "':\n")
+      dupRegex <- paste("(^|[^[:alnum:]_])", escapeRegex(dup), "($|[^[:alnum:]_])", sep = "")
+      chunks <- code[grepl(dupRegex, code, ignore.case = TRUE, perl = TRUE)]
+
+      tokens <- strsplit(chunks, "[^[:alnum:]_]+", perl = TRUE)
+      correctTokenCounts <- vapply(tokens, function(line) sum(dup == line), integer(1))
+      allTokenCounts <- vapply(tokens, function(line) sum(tolower(dup) == tolower(line)), integer(1))
+      suspectLines <- chunks[correctTokenCounts != allTokenCounts]
+
+      msg <- paste0(msg, paste0(paste(" - ", suspectLines), collapse = "\n"))
       msg <- paste0(msg, "\n")
     }
-
     w <- .warning(msg, w = w)
 
   }
@@ -120,19 +125,19 @@ checkAppearance <- function(x, capitalExclusionList = NULL) {
           format(proc.time()["elapsed"] - ptm, width = 6, nsmall = 2, digits = 2), ")")
 
   if (!is.null(x$not_used)) {
-    for (i in 1:dim(x$not_used)[1]) {
-      if (a[x$not_used[i, "name"], dimnames(x$not_used)[[1]][i]]) {
+    for (i in seq_len(dim(x$not_used)[1])) {
+      if (objectsToModules[x$not_used[i, "name"], dimnames(x$not_used)[[1]][i]]) {
         w <- .warning(x$not_used[i, "name"], " appears in not_used.txt of module ", dimnames(x$not_used)[[1]][i],
                       " but is used in the GAMS code of it!", w = w)
       }
-      a[x$not_used[i, "name"], dimnames(x$not_used)[[1]][i]] <- 2
+      objectsToModules[x$not_used[i, "name"], dimnames(x$not_used)[[1]][i]] <- 2
     }
   }
 
   sets <- x$declarations[x$declarations[, "type"] == "set", "names"]
-  aSets <- a[sets, , drop = FALSE]
-  a <- a[!(rownames(a) %in% sets), , drop = FALSE]
-  type <- sub("^(o|)[^_]*?(m|[0-9]{2}|)_.*$", "\\1\\2", dimnames(a)[[1]])
-  names(type) <- dimnames(a)[[1]]
-  return(list(appearance = a, setappearance = aSets, type = type, warnings = w))
+  aSets <- objectsToModules[sets, , drop = FALSE]
+  objectsToModules <- objectsToModules[!(rownames(objectsToModules) %in% sets), , drop = FALSE]
+  type <- sub("^(o|)[^_]*?(m|[0-9]{2}|)_.*$", "\\1\\2", dimnames(objectsToModules)[[1]])
+  names(type) <- dimnames(objectsToModules)[[1]]
+  return(list(appearance = objectsToModules, setappearance = aSets, type = type, warnings = w))
 }
